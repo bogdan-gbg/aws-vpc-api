@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VPC Provisioning API</title>
+  <!-- No inline scripts or styles: the Content-Security-Policy only allows 'self'. -->
+</head>
+<body>
+  <h1>VPC Provisioning API</h1>
+
+  <section>
+    <h2>Session</h2>
+    <p id="session-status">Not logged in.</p>
+    <button type="button" id="login">Log in</button>
+    <button type="button" id="logout">Log out</button>
+    <button type="button" id="copy-token">Copy access token</button>
+    <p>The access token expires after one hour. After it expires, log in again.</p>
+  </section>
+
+  <section>
+    <h2>Create a VPC</h2>
+    <form id="create-form">
+      <p>
+        <label for="name">Name</label>
+        <input id="name" name="name" type="text" maxlength="64" required>
+      </p>
+      <p>
+        <label for="cidr_block">CIDR block</label>
+        <input id="cidr_block" name="cidr_block" type="text" placeholder="10.0.0.0/16" required>
+      </p>
+      <p>
+        <label for="subnet_count">Subnet count (2-6)</label>
+        <input id="subnet_count" name="subnet_count" type="number" min="2" max="6" value="2" required>
+      </p>
+      <p>
+        <label for="subnet_prefix">Subnet prefix (optional)</label>
+        <input id="subnet_prefix" name="subnet_prefix" type="number" min="17" max="28" placeholder="24">
+      </p>
+      <button type="submit" id="create">Create</button>
+    </form>
+  </section>
+
+  <section>
+    <h2>List VPCs</h2>
+    <button type="button" id="list">List</button>
+  </section>
+
+  <section>
+    <h2>Delete a VPC</h2>
+    <p>
+      <label for="delete-id">Id</label>
+      <input id="delete-id" type="text" placeholder="request id (UUID)">
+    </p>
+    <button type="button" id="delete">Delete</button>
+  </section>
+
+  <section>
+    <h2>Response</h2>
+    <pre id="output"></pre>
+  </section>
+
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

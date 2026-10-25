@@ -1,0 +1,412 @@
+openapi: 3.0.3
+info:
+  title: VPC Provisioning API
+  version: 0.1.0
+  description: |
+    Internal "VPC vending" API: creates private AWS VPCs with multiple subnets,
+    stores the result and returns it on request.
+
+    This file is documentation (importable in Postman); the routes are defined in
+    Terraform. Every route requires a Cognito access token. Authorization is open
+    to every authenticated user: everyone sees every record.
+
+    Two error formats exist:
+    - errors returned by the Lambda function use the `Error` schema;
+    - errors returned by API Gateway itself (`401`, `500` on Lambda timeout or
+      crash, `503`, `429`) use the `ApiGatewayError` schema.
+servers:
+  - url: "{api_url}"
+    description: Value of `terraform output api_url` (no trailing slash).
+    variables:
+      api_url:
+        default: https://api.example.com
+security:
+  - bearerAuth: []
+
+paths:
+  /v1/vpcs:
+    post:
+      summary: Create a VPC with subnets
+      description: |
+        Synchronous: the response is returned once the VPC and all subnets exist.
+        The VPC is always private (no Internet Gateway, no NAT). Subnets are the
+        first `subnet_count` consecutive blocks of size `subnet_prefix`, spread
+        round-robin over the available AZs of the region.
+
+        If provisioning fails after it started, a `FAILED` record is stored and
+        the error contains `id`; resources created before the error are listed in
+        `error.leftover_resources` of that record and removed with `DELETE`.
+      operationId: createVpc
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateVpcRequest"
+            example:
+              name: team-a
+              cidr_block: 10.0.0.0/16
+              subnet_count: 3
+      responses:
+        "201":
+          description: VPC and subnets created.
+          headers:
+            Location:
+              description: "`/v1/vpcs/{id}`"
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Vpc"
+        "400":
+          description: "`INVALID_JSON`, `VALIDATION_ERROR` or `SUBNETS_DO_NOT_FIT`. Nothing is created or stored."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: |
+            `CIDR_OVERLAP`: the CIDR overlaps a `CREATED` VPC of this API (nothing
+            created; `details[].conflicting_id` points to it).
+            `VPC_QUOTA_EXCEEDED`: the regional VPC quota is reached (a `FAILED`
+            record is stored; the error contains `id`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    get:
+      summary: List VPC requests
+      description: |
+        Order is not guaranteed. A page can be short or even empty while
+        `next_token` is still returned (the limit applies before the status
+        filter); keep paging until `next_token` is null. All records are visible
+        to any authenticated user. The list is eventually consistent.
+      operationId: listVpcs
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [CREATED, FAILED, DELETED]
+        - name: next_token
+          in: query
+          required: false
+          description: Opaque token from the previous page.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: One page of records.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VpcList"
+        "400":
+          description: "`VALIDATION_ERROR` (`limit`, `status`) or `INVALID_NEXT_TOKEN`."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/vpcs/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Request id returned by `POST` (canonical lowercase UUID).
+        schema:
+          type: string
+          format: uuid
+    get:
+      summary: Get a VPC request
+      description: Read from the store only (no EC2 call), with a consistent read.
+      operationId: getVpc
+      responses:
+        "200":
+          description: The record.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Vpc"
+        "400":
+          description: "`INVALID_ID`."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    delete:
+      summary: Delete a VPC request (soft delete)
+      description: |
+        Deletes the subnets, then the VPC (for `FAILED`: the leftover resources),
+        then marks the record `DELETED`. The record is kept as history. Deleting a
+        `DELETED` record returns `200` (idempotent).
+      operationId: deleteVpc
+      responses:
+        "200":
+          description: The updated record.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Vpc"
+        "400":
+          description: "`INVALID_ID`."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: |
+            `DEPENDENCY_VIOLATION`: the VPC contains resources not created by this
+            API. The status is unchanged; remove those resources and retry.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Cognito access token (valid for one hour, no refresh).
+
+  responses:
+    Unauthorized:
+      description: Returned by API Gateway: missing, invalid or expired token. The function is not invoked.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ApiGatewayError"
+          example:
+            message: Unauthorized
+    NotFound:
+      description: "`NOT_FOUND`: no record with this id."
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    InternalError:
+      description: |
+        Either `INTERNAL_ERROR` from the function (`Error` schema; contains `id`
+        when the error happened after EC2 provisioning started), or API Gateway's
+        `{"message": "Internal Server Error"}` when the function timed out (25 s)
+        or crashed.
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/Error"
+              - $ref: "#/components/schemas/ApiGatewayError"
+    ServiceUnavailable:
+      description: |
+        Returned by API Gateway only if the integration exceeds 30 s. Should not
+        happen, because the function times out at 25 s (observed behavior, not
+        explicitly documented by AWS).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ApiGatewayError"
+
+  schemas:
+    CreateVpcRequest:
+      type: object
+      additionalProperties: false
+      required: [name, cidr_block, subnet_count]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: "^[a-zA-Z0-9][a-zA-Z0-9-_]*$"
+          description: Becomes the Name tag. Not required to be unique.
+        cidr_block:
+          type: string
+          description: |
+            IPv4 CIDR, prefix /16 to /28, inside 10.0.0.0/8, 172.16.0.0/12 or
+            192.168.0.0/16, with no host bits set (10.0.0.1/16 is rejected).
+          example: 10.0.0.0/16
+        subnet_count:
+          type: integer
+          minimum: 2
+          maximum: 6
+        subnet_prefix:
+          type: integer
+          minimum: 17
+          maximum: 28
+          default: 24
+          description: |
+            Must be longer than the VPC prefix, and 2^(subnet_prefix - vpc_prefix)
+            must be at least subnet_count; otherwise `SUBNETS_DO_NOT_FIT`.
+
+    Subnet:
+      type: object
+      properties:
+        subnet_id:
+          type: string
+        cidr_block:
+          type: string
+        availability_zone:
+          type: string
+        availability_zone_id:
+          type: string
+
+    VpcError:
+      type: object
+      description: Present only on FAILED records.
+      properties:
+        code:
+          type: string
+          enum: [VPC_QUOTA_EXCEEDED, INTERNAL_ERROR]
+        message:
+          type: string
+        aws_error_code:
+          type: string
+          nullable: true
+          description: AWS error code (for example VpcLimitExceeded); the raw AWS message is never returned.
+        leftover_resources:
+          type: array
+          description: AWS ids created before the error and left in the account (no rollback).
+          items:
+            type: string
+
+    Vpc:
+      type: object
+      description: Same shape in every response. Absent attributes are null.
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Request id; also the RequestId tag on the AWS resources.
+        status:
+          type: string
+          enum: [CREATED, FAILED, DELETED]
+        name:
+          type: string
+        cidr_block:
+          type: string
+        subnet_count:
+          type: integer
+        subnet_prefix:
+          type: integer
+        vpc_id:
+          type: string
+          nullable: true
+        subnets:
+          type: array
+          nullable: true
+          items:
+            $ref: "#/components/schemas/Subnet"
+        error:
+          allOf:
+            - $ref: "#/components/schemas/VpcError"
+          nullable: true
+        region:
+          type: string
+        account_id:
+          type: string
+        created_by:
+          type: string
+          description: Cognito user id (sub) of the caller, never the email.
+        created_at:
+          type: string
+          format: date-time
+        deleted_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    VpcList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Vpc"
+        next_token:
+          type: string
+          nullable: true
+
+    Error:
+      type: object
+      description: Error returned by the Lambda function.
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, request_id, details]
+          properties:
+            code:
+              type: string
+              enum:
+                - INVALID_JSON
+                - VALIDATION_ERROR
+                - SUBNETS_DO_NOT_FIT
+                - INVALID_ID
+                - INVALID_NEXT_TOKEN
+                - NOT_FOUND
+                - CIDR_OVERLAP
+                - VPC_QUOTA_EXCEEDED
+                - DEPENDENCY_VIOLATION
+                - INTERNAL_ERROR
+            message:
+              type: string
+            request_id:
+              type: string
+              description: Lambda request id; find the details in CloudWatch Logs.
+            details:
+              type: array
+              items:
+                type: object
+                properties:
+                  field:
+                    type: string
+                  message:
+                    type: string
+                  conflicting_id:
+                    type: string
+                    format: uuid
+                    description: Only for CIDR_OVERLAP.
+            id:
+              type: string
+              format: uuid
+              description: Only when the error happened after EC2 provisioning started.
+
+    ApiGatewayError:
+      type: object
+      description: Error returned by API Gateway itself.
+      properties:
+        message:
+          type: string

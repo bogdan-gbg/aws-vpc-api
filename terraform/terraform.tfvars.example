@@ -1,0 +1,6 @@
+# Optional: every variable has a default, so terraform.tfvars is not required.
+# Copy to terraform.tfvars (git-ignored) only to override something.
+# aws_region          = "eu-central-1"
+# project             = "vpc-api"
+# demo_owner_username = "demo-owner"
+# reviewer_username   = "reviewer"
